@@ -699,6 +699,11 @@ func ConformanceIt(text string, body interface{}, timeout ...float64) bool {
 	return It(text+" [Conformance]", body, timeout...)
 }
 
+// Wrapper function for ginkgo It.  Adds "[Conformance:testid]" tag and makes static analysis easier.
+func ConformanceIt2(testid, text string, body interface{}, timeout ...float64) bool {
+	return It(text+" [Conformance:" + testid +"]", body, timeout...)
+}
+
 // PodStateVerification represents a verification of pod state.
 // Any time you have a set of pods that you want to operate against or query,
 // this struct can be used to declaratively identify those pods.

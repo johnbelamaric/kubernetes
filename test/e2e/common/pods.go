@@ -138,7 +138,7 @@ var _ = framework.KubeDescribe("Pods", func() {
 		Testname: Pods, assigned hostip
 		Description: Create a Pod. Pod status MUST return successfully and contains a valid IP address.
 	*/
-	framework.ConformanceIt("should get a host IP [NodeConformance]", func() {
+	framework.ConformanceIt2("pods-lifecycle-hostip", "should get a host IP [NodeConformance]", func() {
 		name := "pod-hostip-" + string(uuid.NewUUID())
 		testHostIP(podClient, &v1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
@@ -160,7 +160,7 @@ var _ = framework.KubeDescribe("Pods", func() {
 		Testname: Pods, lifecycle
 		Description: A Pod is created with a unique label. Pod MUST be accessible when queried using the label selector upon creation. Add a watch, check if the Pod is running. Pod then deleted, The pod deletion timestamp is observed. The watch MUST return the pod deleted event. Query with the original selector for the Pod MUST return empty list.
 	*/
-	framework.ConformanceIt("should be submitted and removed [NodeConformance]", func() {
+	framework.ConformanceIt2("pods-lifecycle-submit-remove", "should be submitted and removed [NodeConformance]", func() {
 		By("creating the pod")
 		name := "pod-submit-remove-" + string(uuid.NewUUID())
 		value := strconv.Itoa(time.Now().Nanosecond())
@@ -286,7 +286,7 @@ var _ = framework.KubeDescribe("Pods", func() {
 		Testname: Pods, update
 		Description: Create a Pod with a unique label. Query for the Pod with the label as selector MUST be successful. Update the pod to change the value of the Label. Query for the Pod with the new value for the label MUST be successful.
 	*/
-	framework.ConformanceIt("should be updated [NodeConformance]", func() {
+	framework.ConformanceIt2("pods-lifecyle-label-update", "should be updated [NodeConformance]", func() {
 		By("creating the pod")
 		name := "pod-update-" + string(uuid.NewUUID())
 		value := strconv.Itoa(time.Now().Nanosecond())
@@ -340,7 +340,7 @@ var _ = framework.KubeDescribe("Pods", func() {
 		Testname: Pods, ActiveDeadlineSeconds
 		Description: Create a Pod with a unique label. Query for the Pod with the label as selector MUST be successful. The Pod is updated with ActiveDeadlineSeconds set on the Pod spec. Pod MUST terminate of the specified time elapses.
 	*/
-	framework.ConformanceIt("should allow activeDeadlineSeconds to be updated [NodeConformance]", func() {
+	framework.ConformanceIt2("pods-lifecycle-active-deadline", "should allow activeDeadlineSeconds to be updated [NodeConformance]", func() {
 		By("creating the pod")
 		name := "pod-update-activedeadlineseconds-" + string(uuid.NewUUID())
 		value := strconv.Itoa(time.Now().Nanosecond())

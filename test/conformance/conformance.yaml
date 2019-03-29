@@ -1,0 +1,53 @@
+area: pods
+api: core/v1.Pod
+- category: Lifecycle
+  id: lifecycle
+  behaviors:
+  - id: hostip
+    description: After Pod creation, the Pod status MUST return successfully and contain a valid IP address.
+  - id: submit-remove
+    description: When a Pod is be created with a unique label, it can be queried using the label selector. It can be watched and will more to Running state. The Pod can be deleted, which sets the pod deletion timestamp, and the watch will receive a deletion event. Afterward, the query with the label selector must be empty.
+  - id: label-update
+    description: Updating a Pod label is successful.
+  - id: active-deadline
+    description: The activeDeadlineSeconds is honored when updated on the podSpec.
+- category: Graceful Termination
+  id: graceful
+  behaviors:
+  - id: podspec-period-honored
+    description: The terminationGracePeriodSeconds as specified in the podSpec is honored.
+  - id: request-period-honored
+    description: The terminationGracePeriod as specified in the DELETE request is honored.
+  - id: with-prestop
+    description: The terminationGracePeriod is honored when a preStop hook blocks.
+- category: Images
+  id: images
+  behaviors:
+  - id: update
+    description: When a podSpec container image is updated, the image is pulled and the container restarted.
+  - id: pull-policy
+    description: The podSpec imagePullPolicy is honored during creation and update.
+- category: OS Namespaces
+  id: os-namespaces
+  behaviors:
+  - id: network-default
+    description: By default, containers in a pod share the same network namespace.
+  - id: network-host
+    description: Containers share the host network namespace when hostNetwork is true.
+  - id: ipc-default
+    description: By default, containers in a pod share the same IPC namespace.
+  - id: ipc-host
+    description: Containers share the host IPC namespace when hostIPC is true.
+  - id: pid-default
+    description: By default, containers are in their own PID namespace.
+  - id: pid-host
+    description: Containers share the host PID namespace when hostPID is true.
+- category: Volumes
+  id: volumes
+  behaviors:
+  - id: sa-token
+    description: Pods by default have a service account token mounted as a volume.
+  - id: sa-token-disabled
+    description: No service account token volume is mounted if automountServiceAccountToken is false.
+  - id: shared
+    description: Two containers can mount the same volume and see each others' files.

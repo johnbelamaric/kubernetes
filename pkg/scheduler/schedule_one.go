@@ -1243,6 +1243,7 @@ func (sched *Scheduler) handleSchedulingFailure(ctx context.Context, podFwk fram
 		utilruntime.HandleErrorWithContext(ctx, err, "Error scheduling pod; retrying", "pod", klog.KObj(pod))
 	}
 
+	var clonedPodInfo *framework.QueuedPodInfo
 	// Check if the Pod exists in informer cache.
 	podLister := podFwk.SharedInformerFactory().Core().V1().Pods().Lister()
 	cachedPod, e := podLister.Pods(pod.Namespace).Get(pod.Name)
@@ -1263,9 +1264,10 @@ func (sched *Scheduler) handleSchedulingFailure(ctx context.Context, podFwk fram
 			// As <cachedPod> is from SharedInformer, we need to do a DeepCopy() here.
 			// ignore this err since apiserver doesn't properly validate affinity terms
 			// and we can't fix the validation for backwards compatibility.
-			podInfo.PodInfo, _ = framework.NewPodInfo(cachedPod.DeepCopy())
-			pod = podInfo.Pod
-			if err := sched.SchedulingQueue.AddUnschedulableIfNotPresent(logger, podInfo, sched.SchedulingQueue.SchedulingCycle()); err != nil {
+			clonedPodInfo = podInfo.DeepCopy()
+			clonedPodInfo.PodInfo, _ = framework.NewPodInfo(cachedPod.DeepCopy())
+			pod = clonedPodInfo.Pod
+			if err := sched.SchedulingQueue.AddUnschedulableIfNotPresent(logger, clonedPodInfo, sched.SchedulingQueue.SchedulingCycle()); err != nil {
 				utilruntime.HandleErrorWithContext(ctx, err, "Error occurred")
 			}
 			calledDone = true
@@ -1277,7 +1279,11 @@ func (sched *Scheduler) handleSchedulingFailure(ctx context.Context, podFwk fram
 	// and the time the scheduler receives a Pod Update for the nominated pod.
 	// Here we check for nil only for tests.
 	if sched.SchedulingQueue != nil {
-		sched.SchedulingQueue.AddNominatedPod(logger, podInfo.PodInfo, nominatingInfo)
+		if clonedPodInfo != nil {
+			sched.SchedulingQueue.AddNominatedPod(logger, clonedPodInfo.PodInfo, nominatingInfo)
+		} else {
+			sched.SchedulingQueue.AddNominatedPod(logger, podInfo.PodInfo, nominatingInfo)
+		}
 	}
 
 	if err == nil {

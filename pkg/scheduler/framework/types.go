@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"maps"
 	"math"
 	"slices"
 	"sort"
@@ -307,29 +308,69 @@ func (n *NodeInfo) Snapshot() fwk.NodeInfo {
 
 // SnapshotConcrete returns a copy of this node, Except that ImageStates is copied without the Nodes field.
 func (n *NodeInfo) SnapshotConcrete() *NodeInfo {
+	return n.snapshotConcrete(nil)
+}
+
+// SnapshotConcreteWithImageStates returns a copy of this node reusing the given
+// pre-built immutable snapshot imageStates map when non-nil, avoiding redundant
+// map and ImageStateSummary allocations.
+func (n *NodeInfo) SnapshotConcreteWithImageStates(imageStates map[string]*fwk.ImageStateSummary) *NodeInfo {
+	return n.snapshotConcrete(imageStates)
+}
+
+func (n *NodeInfo) snapshotConcrete(sharedImageStates map[string]*fwk.ImageStateSummary) *NodeInfo {
+	var res [3]Resource
+	n.Requested.cloneInto(&res[0])
+	n.NonZeroRequested.cloneInto(&res[1])
+	n.Allocatable.cloneInto(&res[2])
+
+	var usedPorts fwk.HostPortInfo
+	if len(n.UsedPorts) > 0 {
+		// HostPortInfo is a map-in-map struct
+		// make sure it's deep copied
+		usedPorts = make(fwk.HostPortInfo, len(n.UsedPorts))
+		for ip, portMap := range n.UsedPorts {
+			clonedPortMap := make(map[fwk.ProtocolPort]struct{}, len(portMap))
+			maps.Copy(clonedPortMap, portMap)
+			usedPorts[ip] = clonedPortMap
+		}
+	} else {
+		usedPorts = make(fwk.HostPortInfo)
+	}
+
+	var imageStates map[string]*fwk.ImageStateSummary
+	if sharedImageStates != nil {
+		imageStates = sharedImageStates
+	} else if len(n.ImageStates) > 0 {
+		imageStates = make(map[string]*fwk.ImageStateSummary, len(n.ImageStates))
+		for imageName, imageState := range n.ImageStates {
+			imageStates[imageName] = imageState.Snapshot()
+		}
+	} else {
+		imageStates = make(map[string]*fwk.ImageStateSummary)
+	}
+
+	var pvcRefCounts map[string]int
+	if len(n.PVCRefCounts) > 0 {
+		pvcRefCounts = make(map[string]int, len(n.PVCRefCounts))
+		maps.Copy(pvcRefCounts, n.PVCRefCounts)
+	} else {
+		pvcRefCounts = make(map[string]int)
+	}
+
 	clone := &NodeInfo{
 		node:             n.node,
-		Requested:        n.Requested.Clone(),
-		NonZeroRequested: n.NonZeroRequested.Clone(),
-		Allocatable:      n.Allocatable.Clone(),
-		UsedPorts:        make(fwk.HostPortInfo),
-		ImageStates:      make(map[string]*fwk.ImageStateSummary),
-		PVCRefCounts:     make(map[string]int),
+		Requested:        &res[0],
+		NonZeroRequested: &res[1],
+		Allocatable:      &res[2],
+		UsedPorts:        usedPorts,
+		ImageStates:      imageStates,
+		PVCRefCounts:     pvcRefCounts,
 		Generation:       n.Generation,
 		DeclaredFeatures: n.DeclaredFeatures.Clone(),
 	}
 	if len(n.Pods) > 0 {
 		clone.Pods = append([]fwk.PodInfo(nil), n.Pods...)
-	}
-	if len(n.UsedPorts) > 0 {
-		// HostPortInfo is a map-in-map struct
-		// make sure it's deep copied
-		for ip, portMap := range n.UsedPorts {
-			clone.UsedPorts[ip] = make(map[fwk.ProtocolPort]struct{})
-			for protocolPort, v := range portMap {
-				clone.UsedPorts[ip][protocolPort] = v
-			}
-		}
 	}
 	if len(n.PodsWithAffinity) > 0 {
 		clone.PodsWithAffinity = append([]fwk.PodInfo(nil), n.PodsWithAffinity...)
@@ -339,16 +380,6 @@ func (n *NodeInfo) SnapshotConcrete() *NodeInfo {
 	}
 	if len(n.PodsWithRequiredNonHostScopedAntiAffinity) > 0 {
 		clone.PodsWithRequiredNonHostScopedAntiAffinity = append([]fwk.PodInfo(nil), n.PodsWithRequiredNonHostScopedAntiAffinity...)
-	}
-	if len(n.ImageStates) > 0 {
-		state := make(map[string]*fwk.ImageStateSummary, len(n.ImageStates))
-		for imageName, imageState := range n.ImageStates {
-			state[imageName] = imageState.Snapshot()
-		}
-		clone.ImageStates = state
-	}
-	for key, value := range n.PVCRefCounts {
-		clone.PVCRefCounts[key] = value
 	}
 
 	return clone
@@ -1641,19 +1672,20 @@ func (r *Resource) Add(rl v1.ResourceList) {
 
 // Clone returns a copy of this resource.
 func (r *Resource) Clone() *Resource {
-	res := &Resource{
-		MilliCPU:         r.MilliCPU,
-		Memory:           r.Memory,
-		AllowedPodNumber: r.AllowedPodNumber,
-		EphemeralStorage: r.EphemeralStorage,
-	}
-	if r.ScalarResources != nil {
-		res.ScalarResources = make(map[v1.ResourceName]int64, len(r.ScalarResources))
-		for k, v := range r.ScalarResources {
-			res.ScalarResources[k] = v
-		}
-	}
+	res := &Resource{}
+	r.cloneInto(res)
 	return res
+}
+
+func (r *Resource) cloneInto(dst *Resource) {
+	dst.MilliCPU = r.MilliCPU
+	dst.Memory = r.Memory
+	dst.AllowedPodNumber = r.AllowedPodNumber
+	dst.EphemeralStorage = r.EphemeralStorage
+	if r.ScalarResources != nil {
+		dst.ScalarResources = make(map[v1.ResourceName]int64, len(r.ScalarResources))
+		maps.Copy(dst.ScalarResources, r.ScalarResources)
+	}
 }
 
 // AddScalar adds a resource by a scalar value of this resource.
@@ -1696,10 +1728,11 @@ func (r *Resource) SetMaxResource(rl v1.ResourceList) {
 // If any pods are given in arguments, their information will be aggregated in
 // the returned object.
 func NewNodeInfo(pods ...*v1.Pod) *NodeInfo {
+	var res [3]Resource
 	ni := &NodeInfo{
-		Requested:        &Resource{},
-		NonZeroRequested: &Resource{},
-		Allocatable:      &Resource{},
+		Requested:        &res[0],
+		NonZeroRequested: &res[1],
+		Allocatable:      &res[2],
 		Generation:       nextGeneration(),
 		UsedPorts:        make(fwk.HostPortInfo),
 		ImageStates:      make(map[string]*fwk.ImageStateSummary),

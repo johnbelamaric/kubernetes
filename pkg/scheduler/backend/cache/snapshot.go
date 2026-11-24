@@ -266,9 +266,9 @@ func (s *Snapshot) StartMutations() error {
 	}
 	s.snapshotBackup = newSnapshotBackupData(s)
 
-	s.nodeInfoMap = make(map[string]*framework.NodeInfo)
+	s.nodeInfoMap = make(map[string]*framework.NodeInfo, len(s.snapshotBackup.nodeInfoMap))
 	for k, v := range s.snapshotBackup.nodeInfoMap {
-		s.nodeInfoMap[k] = v.Snapshot().(*framework.NodeInfo)
+		s.nodeInfoMap[k] = v.SnapshotConcreteWithImageStates(v.ImageStates)
 	}
 
 	s.nodeInfoList = make([]fwk.NodeInfo, 0, len(s.nodeInfoMap))
@@ -290,11 +290,11 @@ func (s *Snapshot) StartMutations() error {
 		}
 	}
 
-	s.usedPVCRefCounts = make(map[string]int)
+	s.usedPVCRefCounts = make(map[string]int, len(s.snapshotBackup.usedPVCRefCounts))
 	maps.Copy(s.usedPVCRefCounts, s.snapshotBackup.usedPVCRefCounts)
 
 	if s.genericWorkloadEnabled {
-		s.podGroupStates = make(map[fwk.EntityKey]*podGroupStateSnapshot)
+		s.podGroupStates = make(map[fwk.EntityKey]*podGroupStateSnapshot, len(s.snapshotBackup.podGroupStates))
 		for k, v := range s.snapshotBackup.podGroupStates {
 			s.podGroupStates[k] = v.Clone()
 		}
@@ -358,7 +358,11 @@ func createUsedPVCRefCounts(nodeInfoMap map[string]*framework.NodeInfo) map[stri
 
 // getNodeImageStates returns the given node's image states based on the given imageExistence map.
 func getNodeImageStates(node *v1.Node, imageExistenceMap map[string]sets.Set[string]) map[string]*fwk.ImageStateSummary {
-	imageStates := make(map[string]*fwk.ImageStateSummary)
+	capHint := 0
+	for i := range node.Status.Images {
+		capHint += len(node.Status.Images[i].Names)
+	}
+	imageStates := make(map[string]*fwk.ImageStateSummary, capHint)
 
 	for _, image := range node.Status.Images {
 		for _, name := range image.Names {

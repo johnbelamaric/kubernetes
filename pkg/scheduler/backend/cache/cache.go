@@ -55,9 +55,113 @@ func New(ctx context.Context, apiDispatcher fwk.APIDispatcher, genericWorkloadEn
 // linked list. When a NodeInfo is updated, it goes to the head of the list.
 // The items closer to the head are the most recently updated items.
 type nodeInfoListItem struct {
-	info *framework.NodeInfo
-	next *nodeInfoListItem
-	prev *nodeInfoListItem
+	info     *framework.NodeInfo
+	next     *nodeInfoListItem
+	prev     *nodeInfoListItem
+	nodeID   uint32
+	imageSet *internedImageSet
+}
+
+// imageStateEntry tracks cluster-wide state for a single image name using a
+// pointer-free node-ID bitset (noscan span) instead of sets.Set[string].
+type imageStateEntry struct {
+	// summary is the live cache-side summary (Nodes is nil; NumNodes is mutated
+	// exclusively under cache.mu.Lock()).
+	summary *fwk.ImageStateSummary
+	// snapshot is a lazily-allocated immutable copy {Size, NumNodes} shared
+	// across Snapshot NodeInfos; cleared whenever NumNodes changes under cache.mu.
+	snapshot *fwk.ImageStateSummary
+	// nodeBits tracks which cached nodeIDs carry this image.
+	nodeBits []uint64
+}
+
+func (e *imageStateEntry) addNode(id uint32) bool {
+	word := int(id >> 6)
+	mask := uint64(1) << (id & 63)
+	if word >= len(e.nodeBits) {
+		grown := make([]uint64, word+1)
+		copy(grown, e.nodeBits)
+		e.nodeBits = grown
+	}
+	if (e.nodeBits[word] & mask) != 0 {
+		return false
+	}
+	e.nodeBits[word] |= mask
+	e.summary.NumNodes++
+	e.snapshot = nil
+	return true
+}
+
+func (e *imageStateEntry) removeNode(id uint32) bool {
+	word := int(id >> 6)
+	if word >= len(e.nodeBits) {
+		return false
+	}
+	mask := uint64(1) << (id & 63)
+	if (e.nodeBits[word] & mask) == 0 {
+		return false
+	}
+	e.nodeBits[word] &^= mask
+	e.summary.NumNodes--
+	e.snapshot = nil
+	return true
+}
+
+func (e *imageStateEntry) hasNode(id uint32) bool {
+	word := int(id >> 6)
+	if word >= len(e.nodeBits) {
+		return false
+	}
+	return (e.nodeBits[word] & (uint64(1) << (id & 63))) != 0
+}
+
+func (e *imageStateEntry) getSnapshot() *fwk.ImageStateSummary {
+	if e.snapshot == nil {
+		e.snapshot = &fwk.ImageStateSummary{
+			Size:     e.summary.Size,
+			NumNodes: e.summary.NumNodes,
+		}
+	}
+	return e.snapshot
+}
+
+type imageSetKey struct {
+	hashSum uint64
+	hashXor uint64
+	count   int
+}
+
+type internedImageSet struct {
+	key         imageSetKey
+	refs        int
+	liveMap     map[string]*fwk.ImageStateSummary
+	snapshotMap map[string]*fwk.ImageStateSummary
+	snapshotGen uint64
+}
+
+func hashImageName(name string) uint64 {
+	var h uint64 = 14695981039346656037
+	for i := 0; i < len(name); i++ {
+		h ^= uint64(name[i])
+		h *= 1099511628211
+	}
+	h ^= h >> 30
+	h *= 0xbf58476d1ce4e5b9
+	h ^= h >> 27
+	h *= 0x94d049bb133111eb
+	return h ^ (h >> 31)
+}
+
+func containerImagesEqual(a, b []v1.ContainerImage) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].SizeBytes != b[i].SizeBytes || !slices.Equal(a[i].Names, b[i].Names) {
+			return false
+		}
+	}
+	return true
 }
 
 type cacheImpl struct {
@@ -76,8 +180,15 @@ type cacheImpl struct {
 	// head of the linked list.
 	headNode *nodeInfoListItem
 	nodeTree *nodeTree
-	// A map from image name to its ImageStateSummary.
-	imageStates map[string]*fwk.ImageStateSummary
+	// Dense node ID allocator for compact image membership bitsets.
+	nextNodeID  uint32
+	freeNodeIDs []uint32
+	// A map from image name to its compact image state entry.
+	imageStates map[string]*imageStateEntry
+	// Intern table of read-only NodeInfo.ImageStates maps shared across nodes
+	// carrying identical image sets, plus generation counter for snapshot maps.
+	imageSets     map[imageSetKey][]*internedImageSet
+	imageStateGen uint64
 	// podGroupStates stores the runtime state for each known pod group (only if GenericWorkload feature gate is enabled).
 	podGroupStates map[fwk.EntityKey]*podGroupState
 	// compositePodGroupStates stores the runtime state for each known composite pod group (only if CompositePodGroup feature gate is enabled).
@@ -112,7 +223,8 @@ func newCache(ctx context.Context, period time.Duration, apiDispatcher fwk.APIDi
 		nodeTree:                 newNodeTree(logger, nil),
 		assumedPods:              sets.New[string](),
 		podStates:                make(map[string]*podState),
-		imageStates:              make(map[string]*fwk.ImageStateSummary),
+		imageStates:              make(map[string]*imageStateEntry),
+		imageSets:                make(map[imageSetKey][]*internedImageSet),
 		podGroupStates:           make(map[fwk.EntityKey]*podGroupState),
 		compositePodGroupStates:  make(map[fwk.EntityKey]*compositePodGroupState),
 		genericWorkloadEnabled:   genericWorkloadEnabled,
@@ -122,10 +234,26 @@ func newCache(ctx context.Context, period time.Duration, apiDispatcher fwk.APIDi
 	}
 }
 
-// newNodeInfoListItem initializes a new nodeInfoListItem.
-func newNodeInfoListItem(ni *framework.NodeInfo) *nodeInfoListItem {
+func (cache *cacheImpl) allocNodeID() uint32 {
+	if n := len(cache.freeNodeIDs); n > 0 {
+		id := cache.freeNodeIDs[n-1]
+		cache.freeNodeIDs = cache.freeNodeIDs[:n-1]
+		return id
+	}
+	id := cache.nextNodeID
+	cache.nextNodeID++
+	return id
+}
+
+func (cache *cacheImpl) freeNodeID(id uint32) {
+	cache.freeNodeIDs = append(cache.freeNodeIDs, id)
+}
+
+// newNodeInfoListItem initializes a new nodeInfoListItem with a compact nodeID.
+func (cache *cacheImpl) newNodeInfoListItem(ni *framework.NodeInfo) *nodeInfoListItem {
 	return &nodeInfoListItem{
-		info: ni,
+		info:   ni,
+		nodeID: cache.allocNodeID(),
 	}
 }
 
@@ -252,7 +380,12 @@ func (cache *cacheImpl) UpdateSnapshot(logger klog.Logger, nodeSnapshot *Snapsho
 				existing = &framework.NodeInfo{}
 				nodeSnapshot.nodeInfoMap[np.Name] = existing
 			}
-			clone := node.info.SnapshotConcrete()
+			var clone *framework.NodeInfo
+			if node.imageSet != nil {
+				clone = node.info.SnapshotConcreteWithImageStates(cache.getSnapshotImageStates(node.imageSet))
+			} else {
+				clone = node.info.SnapshotConcrete()
+			}
 			// We track nodes that have pods with affinity, here we check if this node changed its
 			// status from having pods with affinity to NOT having pods with affinity or the other
 			// way around.
@@ -528,7 +661,7 @@ func (cache *cacheImpl) addPod(logger klog.Logger, pod *v1.Pod, assumePod bool) 
 	}
 	n, ok := cache.nodes[pod.Spec.NodeName]
 	if !ok {
-		n = newNodeInfoListItem(framework.NewNodeInfo())
+		n = cache.newNodeInfoListItem(framework.NewNodeInfo())
 		cache.nodes[pod.Spec.NodeName] = n
 	}
 
@@ -588,6 +721,8 @@ func (cache *cacheImpl) removePod(logger klog.Logger, pod *v1.Pod, forgetPod boo
 		}
 		if len(n.info.Pods) == 0 && n.info.Node() == nil {
 			cache.removeNodeInfoFromList(logger, pod.Spec.NodeName)
+			cache.releaseImageSet(n)
+			cache.freeNodeID(n.nodeID)
 		} else {
 			cache.moveNodeInfoToHead(logger, pod.Spec.NodeName)
 		}
@@ -729,15 +864,15 @@ func (cache *cacheImpl) AddNode(logger klog.Logger, node *v1.Node) {
 
 	n, ok := cache.nodes[node.Name]
 	if !ok {
-		n = newNodeInfoListItem(framework.NewNodeInfo())
+		n = cache.newNodeInfoListItem(framework.NewNodeInfo())
 		cache.nodes[node.Name] = n
 	} else {
-		cache.removeNodeImageStates(n.info.Node())
+		cache.removeNodeImageStates(n.info.Node(), n)
 	}
 	cache.moveNodeInfoToHead(logger, node.Name)
 
 	cache.nodeTree.addNode(logger, node)
-	cache.addNodeImageStates(node, n.info)
+	cache.addNodeImageStates(node, n)
 	n.info.SetNode(node)
 }
 
@@ -745,17 +880,28 @@ func (cache *cacheImpl) UpdateNode(logger klog.Logger, oldNode, newNode *v1.Node
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
 	n, ok := cache.nodes[newNode.Name]
+	imagesUnchanged := false
 	if !ok {
-		n = newNodeInfoListItem(framework.NewNodeInfo())
+		n = cache.newNodeInfoListItem(framework.NewNodeInfo())
 		cache.nodes[newNode.Name] = n
 		cache.nodeTree.addNode(logger, newNode)
 	} else {
-		cache.removeNodeImageStates(n.info.Node())
+		prevNode := n.info.Node()
+		if prevNode != nil && prevNode != newNode && containerImagesEqual(prevNode.Status.Images, newNode.Status.Images) {
+			imagesUnchanged = true
+		} else if oldNode != nil && oldNode != newNode && prevNode != nil && containerImagesEqual(oldNode.Status.Images, newNode.Status.Images) {
+			imagesUnchanged = true
+		}
+		if !imagesUnchanged {
+			cache.removeNodeImageStates(prevNode, n)
+		}
 	}
 	cache.moveNodeInfoToHead(logger, newNode.Name)
 
 	cache.nodeTree.updateNode(logger, oldNode, newNode)
-	cache.addNodeImageStates(newNode, n.info)
+	if !imagesUnchanged {
+		cache.addNodeImageStates(newNode, n)
+	}
 	n.info.SetNode(newNode)
 }
 
@@ -782,15 +928,24 @@ func (cache *cacheImpl) RemoveNode(logger klog.Logger, node *v1.Node) error {
 	// We can't do it unconditionally, because notifications about pods are delivered
 	// in a different watch, and thus can potentially be observed later, even though
 	// they happened before node removal.
+	removedFromList := false
 	if len(n.info.Pods) == 0 {
 		cache.removeNodeInfoFromList(logger, node.Name)
+		removedFromList = true
 	} else {
 		cache.moveNodeInfoToHead(logger, node.Name)
 	}
 	if err := cache.nodeTree.removeNode(logger, node); err != nil {
+		if removedFromList {
+			cache.releaseImageSet(n)
+			cache.freeNodeID(n.nodeID)
+		}
 		return err
 	}
-	cache.removeNodeImageStates(node)
+	cache.removeNodeImageStates(node, n)
+	if removedFromList {
+		cache.freeNodeID(n.nodeID)
+	}
 	return nil
 }
 
@@ -807,47 +962,151 @@ func (cache *cacheImpl) GetNode(name string) (*framework.NodeInfo, error) {
 	return n.info.SnapshotConcrete(), nil
 }
 
-// addNodeImageStates adds states of the images on given node to the given nodeInfo and update the imageStates in
-// scheduler cache. This function assumes the lock to scheduler cache has been acquired.
-func (cache *cacheImpl) addNodeImageStates(node *v1.Node, nodeInfo *framework.NodeInfo) {
-	newSum := make(map[string]*fwk.ImageStateSummary)
-
-	for _, image := range node.Status.Images {
-		for _, name := range image.Names {
-			// update the entry in imageStates
-			state, ok := cache.imageStates[name]
-			if !ok {
-				state = &fwk.ImageStateSummary{
-					Size:  image.SizeBytes,
-					Nodes: sets.New(node.Name),
-				}
-				cache.imageStates[name] = state
-			} else {
-				state.Nodes.Insert(node.Name)
-			}
-			// create the ImageStateSummary for this image
-			if _, ok := newSum[name]; !ok {
-				newSum[name] = state
+func (cache *cacheImpl) matchesImageSet(liveMap map[string]*fwk.ImageStateSummary, images []v1.ContainerImage) bool {
+	for i := range images {
+		for _, name := range images[i].Names {
+			entry := cache.imageStates[name]
+			if entry == nil || liveMap[name] != entry.summary {
+				return false
 			}
 		}
 	}
-	nodeInfo.ImageStates = newSum
+	return true
+}
+
+func (cache *cacheImpl) releaseImageSet(item *nodeInfoListItem) {
+	im := item.imageSet
+	if im == nil {
+		return
+	}
+	item.imageSet = nil
+	im.refs--
+	if im.refs > 0 {
+		return
+	}
+	bucket := cache.imageSets[im.key]
+	for i, cand := range bucket {
+		if cand == im {
+			last := len(bucket) - 1
+			bucket[i] = bucket[last]
+			bucket[last] = nil
+			bucket = bucket[:last]
+			break
+		}
+	}
+	if len(bucket) == 0 {
+		delete(cache.imageSets, im.key)
+	} else {
+		cache.imageSets[im.key] = bucket
+	}
+}
+
+func (cache *cacheImpl) getSnapshotImageStates(im *internedImageSet) map[string]*fwk.ImageStateSummary {
+	if im.snapshotMap != nil && im.snapshotGen == cache.imageStateGen {
+		return im.snapshotMap
+	}
+	snap := make(map[string]*fwk.ImageStateSummary, len(im.liveMap))
+	for name, liveSummary := range im.liveMap {
+		if entry, ok := cache.imageStates[name]; ok {
+			snap[name] = entry.getSnapshot()
+		} else {
+			snap[name] = liveSummary.Snapshot()
+		}
+	}
+	im.snapshotMap = snap
+	im.snapshotGen = cache.imageStateGen
+	return snap
+}
+
+// addNodeImageStates adds states of the images on given node to the given nodeInfo and updates the imageStates in
+// scheduler cache. This function assumes the lock to scheduler cache has been acquired.
+func (cache *cacheImpl) addNodeImageStates(node *v1.Node, item *nodeInfoListItem) {
+	nodeInfo := item.info
+	if len(node.Status.Images) == 0 {
+		item.imageSet = nil
+		if len(nodeInfo.ImageStates) > 0 || nodeInfo.ImageStates == nil {
+			nodeInfo.ImageStates = make(map[string]*fwk.ImageStateSummary)
+		}
+		return
+	}
+
+	var hashSum, hashXor uint64
+	uniqueCount := 0
+	for i := range node.Status.Images {
+		image := &node.Status.Images[i]
+		for _, name := range image.Names {
+			entry, ok := cache.imageStates[name]
+			if !ok {
+				entry = &imageStateEntry{
+					summary: &fwk.ImageStateSummary{
+						Size: image.SizeBytes,
+					},
+				}
+				cache.imageStates[name] = entry
+			}
+			if entry.addNode(item.nodeID) {
+				cache.imageStateGen++
+				h := hashImageName(name)
+				hashSum += h
+				hashXor ^= h
+				uniqueCount++
+			}
+		}
+	}
+
+	if uniqueCount == 0 {
+		item.imageSet = nil
+		if len(nodeInfo.ImageStates) > 0 || nodeInfo.ImageStates == nil {
+			nodeInfo.ImageStates = make(map[string]*fwk.ImageStateSummary)
+		}
+		return
+	}
+
+	key := imageSetKey{hashSum: hashSum, hashXor: hashXor, count: uniqueCount}
+	if bucket := cache.imageSets[key]; len(bucket) > 0 {
+		for _, cand := range bucket {
+			if cache.matchesImageSet(cand.liveMap, node.Status.Images) {
+				cand.refs++
+				item.imageSet = cand
+				nodeInfo.ImageStates = cand.liveMap
+				return
+			}
+		}
+	}
+
+	liveMap := make(map[string]*fwk.ImageStateSummary, uniqueCount)
+	for i := range node.Status.Images {
+		for _, name := range node.Status.Images[i].Names {
+			if _, ok := liveMap[name]; !ok {
+				liveMap[name] = cache.imageStates[name].summary
+			}
+		}
+	}
+	im := &internedImageSet{
+		key:     key,
+		refs:    1,
+		liveMap: liveMap,
+	}
+	cache.imageSets[key] = append(cache.imageSets[key], im)
+	item.imageSet = im
+	nodeInfo.ImageStates = liveMap
 }
 
 // removeNodeImageStates removes the given node record from image entries having the node
 // in imageStates cache. After the removal, if any image becomes free, i.e., the image
 // is no longer available on any node, the image entry will be removed from imageStates.
-func (cache *cacheImpl) removeNodeImageStates(node *v1.Node) {
+func (cache *cacheImpl) removeNodeImageStates(node *v1.Node, item *nodeInfoListItem) {
+	cache.releaseImageSet(item)
 	if node == nil {
 		return
 	}
 
-	for _, image := range node.Status.Images {
-		for _, name := range image.Names {
-			state, ok := cache.imageStates[name]
-			if ok {
-				state.Nodes.Delete(node.Name)
-				if state.Nodes.Len() == 0 {
+	for i := range node.Status.Images {
+		for _, name := range node.Status.Images[i].Names {
+			entry, ok := cache.imageStates[name]
+			if ok && entry.removeNode(item.nodeID) {
+				cache.imageStateGen++
+				if entry.summary.NumNodes == 0 {
 					// Remove the unused image to make sure the length of
 					// imageStates represents the total number of different
 					// images on all nodes

@@ -554,9 +554,13 @@ type ImageStateSummary struct {
 
 // Snapshot returns a copy without Nodes field of ImageStateSummary
 func (iss *ImageStateSummary) Snapshot() *ImageStateSummary {
+	numNodes := iss.NumNodes
+	if iss.Nodes != nil {
+		numNodes = iss.Nodes.Len()
+	}
 	return &ImageStateSummary{
 		Size:     iss.Size,
-		NumNodes: iss.Nodes.Len(),
+		NumNodes: numNodes,
 	}
 }
 

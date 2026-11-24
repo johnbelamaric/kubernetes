@@ -2064,18 +2064,20 @@ func buildNodeInfo(node *v1.Node, pods []*v1.Pod, imageStates map[string]*fwk.Im
 
 // buildImageStates creates ImageStateSummary of image from nodes that will be added in cache.
 func buildImageStates(nodes []*v1.Node) map[string]*fwk.ImageStateSummary {
+	imageNodes := make(map[string]sets.Set[string])
 	imageStates := make(map[string]*fwk.ImageStateSummary)
 	for _, item := range nodes {
 		for _, image := range item.Status.Images {
 			for _, name := range image.Names {
 				if state, ok := imageStates[name]; !ok {
-					state = &fwk.ImageStateSummary{
-						Size:  image.SizeBytes,
-						Nodes: sets.New[string](item.Name),
+					imageNodes[name] = sets.New[string](item.Name)
+					imageStates[name] = &fwk.ImageStateSummary{
+						Size:     image.SizeBytes,
+						NumNodes: 1,
 					}
-					imageStates[name] = state
-				} else {
-					state.Nodes.Insert(item.Name)
+				} else if !imageNodes[name].Has(item.Name) {
+					imageNodes[name].Insert(item.Name)
+					state.NumNodes++
 				}
 			}
 		}
@@ -3445,6 +3447,99 @@ func checkImageStateSummary(nodes map[string]*framework.NodeInfo, imageNames ...
 		}
 	}
 	return true
+}
+
+func TestCacheImageStateBitsetAndInterning(t *testing.T) {
+	logger, ctx := ktesting.NewTestContext(t)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	c := newCache(ctx, time.Second, nil, false, false)
+
+	// Two nodes with identical images in different orders + a duplicate name on n1.
+	n1 := st.MakeNode().Name("n1").Obj()
+	n1.Status.Images = []v1.ContainerImage{
+		{Names: []string{"img-a:1", "img-a:1"}, SizeBytes: 100},
+		{Names: []string{"img-b:1"}, SizeBytes: 200},
+	}
+	n2 := st.MakeNode().Name("n2").Obj()
+	n2.Status.Images = []v1.ContainerImage{
+		{Names: []string{"img-b:1"}, SizeBytes: 200},
+		{Names: []string{"img-a:1"}, SizeBytes: 100},
+	}
+
+	c.AddNode(logger, n1)
+	c.AddNode(logger, n2)
+
+	// Duplicate image name on n1 must not double-count NumNodes.
+	if got := c.imageStates["img-a:1"].summary.NumNodes; got != 2 {
+		t.Fatalf("img-a:1 NumNodes = %d, want 2", got)
+	}
+	if !c.imageStates["img-a:1"].hasNode(c.nodes["n1"].nodeID) || !c.imageStates["img-a:1"].hasNode(c.nodes["n2"].nodeID) {
+		t.Fatalf("expected both n1 and n2 in img-a:1 bitset")
+	}
+	if c.nodes["n1"].imageSet != c.nodes["n2"].imageSet {
+		t.Fatalf("expected identical image sets to share internedImageSet")
+	}
+	if c.nodes["n1"].imageSet.refs != 2 {
+		t.Fatalf("expected internedImageSet refs = 2, got %d", c.nodes["n1"].imageSet.refs)
+	}
+
+	snap := NewEmptySnapshot()
+	if err := c.UpdateSnapshot(logger, snap); err != nil {
+		t.Fatalf("UpdateSnapshot failed: %v", err)
+	}
+	if snap.nodeInfoMap["n1"].ImageStates["img-a:1"] != snap.nodeInfoMap["n2"].ImageStates["img-a:1"] {
+		t.Fatalf("expected snapshot nodes to share immutable *ImageStateSummary pointer")
+	}
+	if snap.nodeInfoMap["n1"].ImageStates["img-a:1"].NumNodes != 2 {
+		t.Fatalf("expected snapshot NumNodes = 2, got %d", snap.nodeInfoMap["n1"].ImageStates["img-a:1"].NumNodes)
+	}
+
+	// StartMutations / EndMutations must preserve ImageStates cleanly.
+	if err := snap.StartMutations(); err != nil {
+		t.Fatalf("StartMutations failed: %v", err)
+	}
+	if snap.nodeInfoMap["n1"].ImageStates["img-a:1"].NumNodes != 2 {
+		t.Fatalf("expected StartMutations snapshot NumNodes = 2")
+	}
+	if err := snap.EndMutations(); err != nil {
+		t.Fatalf("EndMutations failed: %v", err)
+	}
+
+	// Heartbeat UpdateNode with unchanged images must keep imageStateGen unchanged.
+	genBefore := c.imageStateGen
+	n1Heartbeat := n1.DeepCopy()
+	n1Heartbeat.Labels = map[string]string{"hb": "1"}
+	c.UpdateNode(logger, n1, n1Heartbeat)
+	if c.imageStateGen != genBefore {
+		t.Fatalf("expected imageStateGen unchanged on heartbeat update, got %d -> %d", genBefore, c.imageStateGen)
+	}
+
+	// UpdateNode changing images on n1 must decrement img-b:1 and evict old ref.
+	n1Updated := n1Heartbeat.DeepCopy()
+	n1Updated.Status.Images = []v1.ContainerImage{{Names: []string{"img-a:1"}, SizeBytes: 100}}
+	c.UpdateNode(logger, n1Heartbeat, n1Updated)
+	if got := c.imageStates["img-b:1"].summary.NumNodes; got != 1 {
+		t.Fatalf("img-b:1 NumNodes after update = %d, want 1", got)
+	}
+	if c.imageStates["img-b:1"].hasNode(c.nodes["n1"].nodeID) {
+		t.Fatalf("expected n1 removed from img-b:1 bitset")
+	}
+
+	// Remove both nodes and verify complete eviction of imageStates and imageSets.
+	if err := c.RemoveNode(logger, n1Updated); err != nil {
+		t.Fatalf("RemoveNode(n1) failed: %v", err)
+	}
+	if err := c.RemoveNode(logger, n2); err != nil {
+		t.Fatalf("RemoveNode(n2) failed: %v", err)
+	}
+	if len(c.imageStates) != 0 {
+		t.Fatalf("expected empty imageStates after removing all nodes, got %d", len(c.imageStates))
+	}
+	if len(c.imageSets) != 0 {
+		t.Fatalf("expected empty imageSets after removing all nodes, got %d", len(c.imageSets))
+	}
 }
 
 func setupCacheOf1kNodes30kPods(b *testing.B) Cache {

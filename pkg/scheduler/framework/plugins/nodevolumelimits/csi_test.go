@@ -1408,3 +1408,89 @@ func TestVolumeLimitScalingGate(t *testing.T) {
 		})
 	}
 }
+
+func TestCSILimitsPreFilterCycleStateParity(t *testing.T) {
+	newPod := st.MakePod().PVC("csi-ebs.csi.aws.com-0").Obj()
+	for _, limit := range []int32{0, 1, 2} {
+		t.Run(fmt.Sprintf("limit=%d", limit), func(t *testing.T) {
+			node, csiNode := getNodeWithPodAndVolumeLimits("csinode", []*v1.Pod{}, limit, ebsCSIDriverName)
+			fakecli := buildFakeClientWithVALister(0, ebsCSIDriverName)
+			informerFactory := informers.NewSharedInformerFactory(fakecli, 0)
+			if err := informerFactory.Storage().V1().VolumeAttachments().Informer().AddIndexers(cache.Indexers{vaIndexKey: volumeAttachmentIndexer}); err != nil {
+				t.Fatal(err)
+			}
+			_, ctx := ktesting.NewTestContext(t)
+			informerFactory.StartWithContext(ctx)
+			informerFactory.WaitForCacheSyncWithContext(ctx)
+
+			p := &CSILimits{
+				csiManager:               NewCSIManager(getFakeCSINodeLister(csiNode)),
+				pvLister:                 getFakeCSIPVLister("csi", ebsCSIDriverName),
+				pvcLister:                getFakeCSIPVCLister("csi", scName, ebsCSIDriverName),
+				scLister:                 getFakeCSIStorageClassLister(scName, ebsCSIDriverName),
+				vaLister:                 informerFactory.Storage().V1().VolumeAttachments().Lister(),
+				vaIndexer:                informerFactory.Storage().V1().VolumeAttachments().Informer().GetIndexer(),
+				csiDriverLister:          getFakeCSIDriverLister(ebsCSIDriverName),
+				enableVolumeLimitScaling: true,
+				randomVolumeIDPrefix:     rand.String(32),
+				translator:               csitrans.New(),
+			}
+
+			state := framework.NewCycleState()
+			_, preStatus := p.PreFilter(ctx, state, newPod, []fwk.NodeInfo{node})
+			if !preStatus.IsSuccess() {
+				t.Fatalf("unexpected PreFilter status: %v", preStatus)
+			}
+			gotWithState := p.Filter(ctx, state, newPod, node)
+			gotWithoutState := p.Filter(ctx, nil, newPod, node)
+			if diff := cmp.Diff(gotWithoutState, gotWithState, statusCmpOpts...); diff != "" {
+				t.Errorf("PreFilter+Filter parity mismatch (-withoutState +withState):\n%s", diff)
+			}
+		})
+	}
+}
+
+func BenchmarkCSILimitsFilter(b *testing.B) {
+	newPod := st.MakePod().PVC("csi-ebs.csi.aws.com-0").Obj()
+	node, csiNode := getNodeWithPodAndVolumeLimits("csinode", []*v1.Pod{}, 10, ebsCSIDriverName)
+	fakecli := buildFakeClientWithVALister(0, ebsCSIDriverName)
+	informerFactory := informers.NewSharedInformerFactory(fakecli, 0)
+	if err := informerFactory.Storage().V1().VolumeAttachments().Informer().AddIndexers(cache.Indexers{vaIndexKey: volumeAttachmentIndexer}); err != nil {
+		b.Fatal(err)
+	}
+	_, ctx := ktesting.NewTestContext(b)
+	informerFactory.StartWithContext(ctx)
+	informerFactory.WaitForCacheSyncWithContext(ctx)
+
+	p := &CSILimits{
+		csiManager:               NewCSIManager(getFakeCSINodeLister(csiNode)),
+		pvLister:                 getFakeCSIPVLister("csi", ebsCSIDriverName),
+		pvcLister:                getFakeCSIPVCLister("csi", scName, ebsCSIDriverName),
+		scLister:                 getFakeCSIStorageClassLister(scName, ebsCSIDriverName),
+		vaLister:                 informerFactory.Storage().V1().VolumeAttachments().Lister(),
+		vaIndexer:                informerFactory.Storage().V1().VolumeAttachments().Informer().GetIndexer(),
+		csiDriverLister:          getFakeCSIDriverLister(ebsCSIDriverName),
+		enableVolumeLimitScaling: true,
+		randomVolumeIDPrefix:     rand.String(32),
+		translator:               csitrans.New(),
+	}
+
+	nodes := make([]fwk.NodeInfo, 100)
+	for i := range nodes {
+		nodes[i] = node
+	}
+
+	b.ReportAllocs()
+	for b.Loop() {
+		state := framework.NewCycleState()
+		_, preStatus := p.PreFilter(ctx, state, newPod, nodes)
+		if !preStatus.IsSuccess() {
+			b.Fatalf("unexpected PreFilter status: %v", preStatus)
+		}
+		for _, n := range nodes {
+			if st := p.Filter(ctx, state, newPod, n); !st.IsSuccess() {
+				b.Fatalf("unexpected Filter status: %v", st)
+			}
+		}
+	}
+}

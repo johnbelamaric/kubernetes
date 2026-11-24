@@ -161,9 +161,11 @@ func IsLimitOnlyResource(name v1.ResourceName) bool {
 // those pod-level values are used in calculating Pod Requests.
 // The computation is part of the API and must be reviewed as an API change.
 func PodRequests(pod *v1.Pod, opts PodResourcesOptions) v1.ResourceList {
-	reqs := v1.ResourceList{}
+	var reqs v1.ResourceList
 	if !opts.SkipContainerLevelResources {
 		reqs = AggregateContainerRequests(pod, opts)
+	} else {
+		reqs = v1.ResourceList{}
 	}
 
 	if !opts.SkipPodLevelResources && IsPodLevelRequestsSet(pod) {
@@ -287,27 +289,58 @@ func isRestartableInitContainer(container *v1.Container) bool {
 	return container != nil && container.RestartPolicy != nil && *container.RestartPolicy == v1.ContainerRestartPolicyAlways
 }
 
+func hasNoContainerStatusResources(statuses []v1.ContainerStatus) bool {
+	for i := range statuses {
+		if statuses[i].AllocatedResources != nil || (statuses[i].Resources != nil && statuses[i].Resources.Requests != nil) {
+			return false
+		}
+	}
+	return true
+}
+
 // aggregateContainerResourcesByFn aggregates the resources that getResourceList returns for the
 // containers in the pod spec and, with UseStatusResources, for the running containers removed
 // from it.
 func aggregateContainerResourcesByFn(pod *v1.Pod, opts PodResourcesOptions, getResourceList func(container *v1.Container, containerStatus *v1.ContainerStatus, isResizeInfeasible bool) v1.ResourceList) v1.ResourceList {
+	result := make(v1.ResourceList, 4)
+	aggregateContainerResourcesInto(result, pod, opts, getResourceList)
+	return result
+}
+
+func aggregateContainerResourcesInto(result v1.ResourceList, pod *v1.Pod, opts PodResourcesOptions, getResourceList func(container *v1.Container, containerStatus *v1.ContainerStatus, isResizeInfeasible bool) v1.ResourceList) {
 	var isResizeInfeasible bool
 	var statuses, initStatuses []v1.ContainerStatus
 	if opts.UseStatusResources {
 		isResizeInfeasible = IsPodResizeInfeasible(pod)
 		statuses, initStatuses = pod.Status.ContainerStatuses, pod.Status.InitContainerStatuses
 	}
-	result := v1.ResourceList{}
-	for pair := range containerStatusPairs(pod.Spec.Containers, statuses) {
-		containerResources := getResourceList(pair.container, pair.status, isResizeInfeasible)
-		if pair.container != nil && len(opts.NonMissingContainerRequests) > 0 {
-			containerResources = applyNonMissing(containerResources, opts.NonMissingContainerRequests)
+	hasNonMissing := len(opts.NonMissingContainerRequests) > 0
+	if len(statuses) == 0 {
+		for i := range pod.Spec.Containers {
+			containerResources := getResourceList(&pod.Spec.Containers[i], nil, isResizeInfeasible)
+			if hasNonMissing {
+				addResourceListWithNonMissing(result, containerResources, opts.NonMissingContainerRequests)
+			} else {
+				addResourceList(result, containerResources)
+			}
 		}
-		addResourceList(result, containerResources)
+	} else {
+		for pair := range containerStatusPairs(pod.Spec.Containers, statuses) {
+			containerResources := getResourceList(pair.container, pair.status, isResizeInfeasible)
+			if pair.container != nil && hasNonMissing {
+				addResourceListWithNonMissing(result, containerResources, opts.NonMissingContainerRequests)
+			} else {
+				addResourceList(result, containerResources)
+			}
+		}
 	}
 
-	restartableInitContainerResources := v1.ResourceList{}
-	initContainerResources := v1.ResourceList{}
+	if len(pod.Spec.InitContainers) == 0 && len(initStatuses) == 0 {
+		return
+	}
+
+	var restartableInitContainerResources v1.ResourceList
+	initContainerResources := make(v1.ResourceList, 4)
 	// init containers define the minimum of any resource
 	//
 	// Let's say `InitContainerUse(i)` is the resource requirements when the i-th
@@ -315,29 +348,50 @@ func aggregateContainerResourcesByFn(pod *v1.Pod, opts PodResourcesOptions, getR
 	// `InitContainerUse(i) = sum(Resources of restartable init containers with index < i) + Resources of i-th init container`.
 	//
 	// See https://github.com/kubernetes/enhancements/tree/master/keps/sig-node/753-sidecar-containers#exposing-pod-resource-requirements for the detail.
-	for pair := range containerStatusPairs(pod.Spec.InitContainers, initStatuses) {
-		containerResources := getResourceList(pair.container, pair.status, isResizeInfeasible)
-		if pair.container != nil && len(opts.NonMissingContainerRequests) > 0 {
-			containerResources = applyNonMissing(containerResources, opts.NonMissingContainerRequests)
+	processInit := func(c *v1.Container, s *v1.ContainerStatus) {
+		containerResources := getResourceList(c, s, isResizeInfeasible)
+		if isRestartableInitContainer(c) {
+			if restartableInitContainerResources == nil {
+				restartableInitContainerResources = make(v1.ResourceList, 4)
+			}
+			if c != nil && hasNonMissing {
+				addResourceListWithNonMissing(result, containerResources, opts.NonMissingContainerRequests)
+				addResourceListWithNonMissing(restartableInitContainerResources, containerResources, opts.NonMissingContainerRequests)
+			} else {
+				addResourceList(result, containerResources)
+				addResourceList(restartableInitContainerResources, containerResources)
+			}
+			maxResourceList(initContainerResources, restartableInitContainerResources)
+			return
 		}
-		// Is the init container marked as a restartable init container?
-		if isRestartableInitContainer(pair.container) {
-			// and add them to the resulting cumulative container requests
-			addResourceList(result, containerResources)
-
-			// track our cumulative restartable init container resources
-			addResourceList(restartableInitContainerResources, containerResources)
-			containerResources = restartableInitContainerResources
+		if len(restartableInitContainerResources) == 0 {
+			if c != nil && hasNonMissing {
+				maxResourceListWithNonMissing(initContainerResources, containerResources, opts.NonMissingContainerRequests)
+			} else {
+				maxResourceList(initContainerResources, containerResources)
+			}
+			return
+		}
+		combinedResources := make(v1.ResourceList, len(restartableInitContainerResources)+len(containerResources))
+		if c != nil && hasNonMissing {
+			addResourceListWithNonMissing(combinedResources, containerResources, opts.NonMissingContainerRequests)
 		} else {
-			combinedResources := v1.ResourceList{}
 			addResourceList(combinedResources, containerResources)
-			addResourceList(combinedResources, restartableInitContainerResources)
-			containerResources = combinedResources
 		}
-		maxResourceList(initContainerResources, containerResources)
+		addResourceList(combinedResources, restartableInitContainerResources)
+		maxResourceList(initContainerResources, combinedResources)
+	}
+
+	if len(initStatuses) == 0 {
+		for i := range pod.Spec.InitContainers {
+			processInit(&pod.Spec.InitContainers[i], nil)
+		}
+	} else {
+		for pair := range containerStatusPairs(pod.Spec.InitContainers, initStatuses) {
+			processInit(pair.container, pair.status)
+		}
 	}
 	maxResourceList(result, initContainerResources)
-	return result
 }
 
 // AggregateContainerRequests computes the total resource requests of all the containers
@@ -353,18 +407,30 @@ func AggregateContainerRequests(pod *v1.Pod, opts PodResourcesOptions) v1.Resour
 		extraReqs = getExtraNodeAllocatableResources(pod, "").Requests
 	}
 	if !opts.UseStatusResources {
-		addResourceList(reqs, aggregateContainerResourcesByFn(pod, opts, containerSpecRequests))
-		addResourceList(reqs, extraReqs)
+		aggregateContainerResourcesInto(reqs, pod, opts, containerSpecRequests)
+		if len(extraReqs) > 0 {
+			addResourceList(reqs, extraReqs)
+		}
 	} else {
 		isResizeInfeasible := IsPodResizeInfeasible(pod)
+		usePodLevelStatus := opts.InPlacePodLevelResourcesVerticalScalingEnabled && pod.Status.AllocatedResources != nil && pod.Status.Resources != nil && pod.Status.Resources.Requests != nil
+		if !usePodLevelStatus && !isResizeInfeasible && len(extraReqs) == 0 &&
+			hasNoContainerStatusResources(pod.Status.ContainerStatuses) &&
+			hasNoContainerStatusResources(pod.Status.InitContainerStatuses) {
+			aggregateContainerResourcesInto(reqs, pod, opts, containerSpecRequests)
+			return reqs
+		}
+
 		specReqs := aggregateContainerResourcesByFn(pod, opts, containerSpecRequests)
-		addResourceList(specReqs, extraReqs)
+		if len(extraReqs) > 0 {
+			addResourceList(specReqs, extraReqs)
+		}
 		var allocatedReqs, actuatedReqs v1.ResourceList
 		// When pod-level status maps are populated, they already contain the aggregate values across all containers.
 		// When unpopulated (e.g., at creation time or when feature gates are disabled), we fall back to container status aggregation.
 		// Once InPlacePodLevelResourcesVerticalScaling is GA and its feature gate is removed,
 		// container-level fallback becomes redundant because max(spec, actuated, allocated) naturally evaluates to spec at creation time.
-		if opts.InPlacePodLevelResourcesVerticalScalingEnabled && pod.Status.AllocatedResources != nil && pod.Status.Resources != nil && pod.Status.Resources.Requests != nil {
+		if usePodLevelStatus {
 			allocatedReqs = pod.Status.AllocatedResources
 			actuatedReqs = pod.Status.Resources.Requests
 			// DRA values are not added to allocatedReqs and actuatedReqs because
@@ -380,7 +446,9 @@ func AggregateContainerRequests(pod *v1.Pod, opts PodResourcesOptions) v1.Resour
 			// DRA allocations are added to allocatedReqs here because Kubelet does not include DRA in pod.Status.ContainerStatuses[].AllocatedResources. Adding them prevents under-reporting.
 			// This is a temporary fallback until InPlacePodLevelResourcesVerticalScaling is Beta/GA on all nodes and pod-level status fields which natively include DRA are always available.
 			allocatedReqs = aggregateContainerResourcesByFn(pod, opts, containerAllocatedRequests)
-			addResourceList(allocatedReqs, extraReqs)
+			if len(extraReqs) > 0 {
+				addResourceList(allocatedReqs, extraReqs)
+			}
 			actuatedReqs = aggregateContainerResourcesByFn(pod, opts, containerActuatedRequests)
 		}
 
@@ -551,8 +619,10 @@ func AggregateContainerLimits(pod *v1.Pod, opts PodResourcesOptions) v1.Resource
 		extraLimits = getExtraNodeAllocatableResources(pod, "").Limits
 	}
 	if !opts.UseStatusResources {
-		addResourceList(limits, aggregateContainerResourcesByFn(pod, opts, containerSpecLimits))
-		addResourceList(limits, extraLimits)
+		aggregateContainerResourcesInto(limits, pod, opts, containerSpecLimits)
+		if len(extraLimits) > 0 {
+			addResourceList(limits, extraLimits)
+		}
 	} else {
 		isResizeInfeasible := IsPodResizeInfeasible(pod)
 		specLimits := aggregateContainerResourcesByFn(pod, opts, containerSpecLimits)
@@ -598,6 +668,37 @@ func addResourceList(list, newList v1.ResourceList) {
 		} else {
 			value.Add(quantity)
 			list[name] = value
+		}
+	}
+}
+
+func addResourceListWithNonMissing(list, newList, nonMissing v1.ResourceList) {
+	addResourceList(list, newList)
+	for name, quantity := range nonMissing {
+		if IsLimitOnlyResource(name) {
+			continue
+		}
+		if _, found := newList[name]; !found {
+			if value, ok := list[name]; !ok {
+				list[name] = quantity
+			} else {
+				value.Add(quantity)
+				list[name] = value
+			}
+		}
+	}
+}
+
+func maxResourceListWithNonMissing(list, newList, nonMissing v1.ResourceList) {
+	maxResourceList(list, newList)
+	for name, quantity := range nonMissing {
+		if IsLimitOnlyResource(name) {
+			continue
+		}
+		if _, found := newList[name]; !found {
+			if value, ok := list[name]; !ok || quantity.Cmp(value) > 0 {
+				list[name] = quantity
+			}
 		}
 	}
 }

@@ -7462,3 +7462,82 @@ func TestLimitOnlyResources(t *testing.T) {
 		t.Errorf("PodLimits() mismatch (-want +got):\n%s", diff.Diff(wantLimits, gotLimits))
 	}
 }
+
+func BenchmarkPodRequests(b *testing.B) {
+	sidecarPolicy := v1.ContainerRestartPolicyAlways
+	pod := &v1.Pod{
+		Spec: v1.PodSpec{
+			InitContainers: []v1.Container{
+				{
+					Name: "init-1",
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceCPU:    resource.MustParse("100m"),
+							v1.ResourceMemory: resource.MustParse("128Mi"),
+						},
+					},
+				},
+				{
+					Name:          "sidecar-1",
+					RestartPolicy: &sidecarPolicy,
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceCPU:    resource.MustParse("50m"),
+							v1.ResourceMemory: resource.MustParse("64Mi"),
+						},
+					},
+				},
+			},
+			Containers: []v1.Container{
+				{
+					Name: "app-1",
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceCPU:    resource.MustParse("500m"),
+							v1.ResourceMemory: resource.MustParse("512Mi"),
+						},
+					},
+				},
+				{
+					Name: "app-2",
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceCPU:    resource.MustParse("250m"),
+							v1.ResourceMemory: resource.MustParse("256Mi"),
+						},
+					},
+				},
+			},
+			Overhead: v1.ResourceList{
+				v1.ResourceCPU:    resource.MustParse("50m"),
+				v1.ResourceMemory: resource.MustParse("64Mi"),
+			},
+		},
+	}
+
+	b.Run("Default", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			reqs := PodRequests(pod, PodResourcesOptions{})
+			if len(reqs) == 0 {
+				b.Fatal("empty requests")
+			}
+		}
+	})
+	b.Run("WithNonMissingAndStatus", func(b *testing.B) {
+		opts := PodResourcesOptions{
+			UseStatusResources: true,
+			NonMissingContainerRequests: v1.ResourceList{
+				v1.ResourceCPU:    resource.MustParse("100m"),
+				v1.ResourceMemory: resource.MustParse("128Mi"),
+			},
+		}
+		b.ReportAllocs()
+		for b.Loop() {
+			reqs := PodRequests(pod, opts)
+			if len(reqs) == 0 {
+				b.Fatal("empty requests")
+			}
+		}
+	})
+}

@@ -135,11 +135,11 @@ func (r *QueuedEntitiesRecorder) Clear() {
 	r.entities(CompositePodGroup, OperationInitialPlacement).Set(float64(0))
 }
 
-// histogramVecMetric is the data structure passed in the buffer channel between the main framework thread
-// and the metricsRecorder goroutine.
+// histogramVecMetric is the value-typed data structure passed in the buffer channel
+// between the main framework thread and the metricsRecorder goroutine.
 type histogramVecMetric struct {
 	metric      *metrics.HistogramVec
-	labelValues []string
+	labelValues [3]string
 	value       float64
 }
 
@@ -156,14 +156,15 @@ type gaugeVecMetricKey struct {
 
 type counterVecMetric struct {
 	metric      *metrics.CounterVec
-	labelValues []string
+	labelValues [3]string
+	labelCount  uint8
 	value       float64
 }
 
 // MetricAsyncRecorder records metric in a separate goroutine to avoid overhead in the critical path.
 type MetricAsyncRecorder struct {
 	// bufferCh is a channel that serves as a metrics buffer before the metricsRecorder goroutine reports it.
-	bufferCh chan *histogramVecMetric
+	bufferCh chan histogramVecMetric
 	// if bufferSize is reached, incoming metrics will be discarded.
 	bufferSize int
 	// how often the recorder runs to flush the metrics.
@@ -178,7 +179,7 @@ type MetricAsyncRecorder struct {
 	aggregatedInflightEventMetricBufferCh      chan *gaugeVecMetric
 
 	// counterBufferCh is a channel for async counter increments.
-	counterBufferCh chan *counterVecMetric
+	counterBufferCh chan counterVecMetric
 
 	// stopCh is used to stop the goroutine which periodically flushes metrics.
 	stopCh <-chan struct{}
@@ -189,8 +190,8 @@ type MetricAsyncRecorder struct {
 
 func NewMetricsAsyncRecorder(bufferSize int, interval time.Duration, stopCh <-chan struct{}) *MetricAsyncRecorder {
 	recorder := &MetricAsyncRecorder{
-		bufferCh:                      make(chan *histogramVecMetric, bufferSize),
-		counterBufferCh:               make(chan *counterVecMetric, bufferSize),
+		bufferCh:                      make(chan histogramVecMetric, bufferSize),
+		counterBufferCh:               make(chan counterVecMetric, bufferSize),
 		bufferSize:                    bufferSize,
 		interval:                      interval,
 		stopCh:                        stopCh,
@@ -223,11 +224,16 @@ func (r *MetricAsyncRecorder) ObserveQueueingHintDurationAsync(pluginName, event
 
 // ObserveCounterAsync increments a counter metric asynchronously.
 func (r *MetricAsyncRecorder) ObserveCounterAsync(m *metrics.CounterVec, value float64, labelValues ...string) {
-	newMetric := &counterVecMetric{
-		metric:      m,
-		labelValues: labelValues,
-		value:       value,
+	if len(labelValues) > len(counterVecMetric{}.labelValues) {
+		m.WithLabelValues(labelValues...).Add(value)
+		return
 	}
+	newMetric := counterVecMetric{
+		metric:     m,
+		labelCount: uint8(len(labelValues)),
+		value:      value,
+	}
+	copy(newMetric.labelValues[:], labelValues)
 	select {
 	case r.counterBufferCh <- newMetric:
 	default:
@@ -258,14 +264,14 @@ func (r *MetricAsyncRecorder) ObserveInFlightEventsAsync(eventLabel string, valu
 		}
 		r.aggregatedInflightEventMetricLastFlushTime = time.Now()
 		// reset
-		r.aggregatedInflightEventMetric = make(map[gaugeVecMetricKey]int)
+		clear(r.aggregatedInflightEventMetric)
 	}
 }
 
-func (r *MetricAsyncRecorder) observeMetricAsync(m *metrics.HistogramVec, value float64, labelsValues ...string) {
-	newMetric := &histogramVecMetric{
+func (r *MetricAsyncRecorder) observeMetricAsync(m *metrics.HistogramVec, value float64, l0, l1, l2 string) {
+	newMetric := histogramVecMetric{
 		metric:      m,
-		labelValues: labelsValues,
+		labelValues: [3]string{l0, l1, l2},
 		value:       value,
 	}
 	select {
@@ -292,9 +298,9 @@ func (r *MetricAsyncRecorder) FlushMetrics() {
 	for i := 0; i < r.bufferSize; i++ {
 		select {
 		case m := <-r.bufferCh:
-			m.metric.WithLabelValues(m.labelValues...).Observe(m.value)
+			m.metric.WithLabelValues(m.labelValues[0], m.labelValues[1], m.labelValues[2]).Observe(m.value)
 		case m := <-r.counterBufferCh:
-			m.metric.WithLabelValues(m.labelValues...).Add(m.value)
+			m.metric.WithLabelValues(m.labelValues[:m.labelCount]...).Add(m.value)
 		default:
 			// no more value
 		}

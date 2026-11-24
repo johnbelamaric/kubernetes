@@ -428,3 +428,17 @@ func TestNewMetricsAsyncRecorder(t *testing.T) {
 		check("buffered metrics are not flushed after stopping")
 	})
 }
+
+func BenchmarkObservePluginDurationAsync(b *testing.B) {
+	Register()
+	stop := make(chan struct{})
+	defer close(stop)
+	r := NewMetricsAsyncRecorder(1000, time.Hour, stop)
+	b.ReportAllocs()
+	for b.Loop() {
+		r.ObservePluginDurationAsync(Filter, "NodeResourcesFit", "Success", 0.0001)
+		if len(r.bufferCh) == 1000 {
+			r.FlushMetrics()
+		}
+	}
+}

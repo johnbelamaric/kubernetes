@@ -19,6 +19,7 @@ package framework
 import (
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -80,47 +81,33 @@ func isCycleStateEqual(a, b *CycleState) (bool, string) {
 		return false, fmt.Sprintf("CycleState A and B have different SkipAllPostFilterPlugins sets. -wanted,+got:\n%s", diff)
 	}
 
-	var msg string
-	isEqual := true
-	countA := 0
-	a.storage.Range(func(k, v1 interface{}) bool {
-		countA++
-		v2, ok := b.storage.Load(k)
-		if !ok {
-			isEqual = false
-			msg = fmt.Sprintf("CycleState B doesn't have the data which CycleState A has. key: %v, data: %v", k, v1)
-			return false
+	var entriesA, entriesB []cycleStateEntry
+	if p := a.storage.Load(); p != nil {
+		entriesA = *p
+	}
+	if p := b.storage.Load(); p != nil {
+		entriesB = *p
+	}
+
+	for _, eA := range entriesA {
+		v2, err := b.Read(eA.key)
+		if err != nil {
+			return false, fmt.Sprintf("CycleState B doesn't have the data which CycleState A has. key: %v, data: %v", eA.key, eA.val)
 		}
 
-		typed1, ok1 := v1.(*fakeData)
+		typed1, ok1 := eA.val.(*fakeData)
 		typed2, ok2 := v2.(*fakeData)
 		if !ok1 || !ok2 {
-			isEqual = false
-			msg = "CycleState has the data which is not type *fakeData."
-			return false
+			return false, "CycleState has the data which is not type *fakeData."
 		}
 
 		if typed1.data != typed2.data {
-			isEqual = false
-			msg = fmt.Sprintf("CycleState B has a different data on key %v. A: %v, B: %v", k, typed1.data, typed2.data)
-			return false
+			return false, fmt.Sprintf("CycleState B has a different data on key %v. A: %v, B: %v", eA.key, typed1.data, typed2.data)
 		}
-
-		return true
-	})
-
-	if !isEqual {
-		return false, msg
 	}
 
-	countB := 0
-	b.storage.Range(func(k, _ interface{}) bool {
-		countB++
-		return true
-	})
-
-	if countA != countB {
-		return false, fmt.Sprintf("two Cyclestates have different numbers of data. A: %v, B: %v", countA, countB)
+	if len(entriesA) != len(entriesB) {
+		return false, fmt.Sprintf("two Cyclestates have different numbers of data. A: %v, B: %v", len(entriesA), len(entriesB))
 	}
 
 	return true, ""
@@ -400,10 +387,11 @@ func TestMergePlacementStatesInto(t *testing.T) {
 				t.Fatal("expected destination state to be registered")
 			}
 			gotData := make(map[fwk.StateKey]string)
-			merged.storage.Range(func(key, value interface{}) bool {
-				gotData[key.(fwk.StateKey)] = value.(*fakeData).data
-				return true
-			})
+			if p := merged.storage.Load(); p != nil {
+				for _, entry := range *p {
+					gotData[entry.key] = entry.val.(*fakeData).data
+				}
+			}
 			if diff := cmp.Diff(tt.wantData, gotData); diff != "" {
 				t.Errorf("unexpected merged state (-want,+got):\n%s", diff)
 			}
@@ -453,4 +441,86 @@ func TestCloneCopiesPlacementStates(t *testing.T) {
 	if data.(*fakeData).data != "v" {
 		t.Errorf("cloned placement state shares mutable data with source: got %q", data.(*fakeData).data)
 	}
+}
+
+func TestCycleStateSkipMasks(t *testing.T) {
+	c := NewCycleState()
+	if _, ok := c.GetSkipFilterMask(); ok {
+		t.Fatalf("expected filter mask unset initially")
+	}
+	if _, ok := c.GetSkipScoreMask(); ok {
+		t.Fatalf("expected score mask unset initially")
+	}
+
+	c.SetSkipFilterPlugins(sets.New("f1"))
+	c.SetSkipFilterMask(0b101)
+	c.SetSkipScorePlugins(sets.New("s2"))
+	c.SetSkipScoreMask(0b10)
+
+	if mask, ok := c.GetSkipFilterMask(); !ok || mask != 0b101 {
+		t.Fatalf("GetSkipFilterMask() = (%b, %v), want (101, true)", mask, ok)
+	}
+	if mask, ok := c.GetSkipScoreMask(); !ok || mask != 0b10 {
+		t.Fatalf("GetSkipScoreMask() = (%b, %v), want (10, true)", mask, ok)
+	}
+
+	cloned := c.Clone().(*CycleState)
+	if mask, ok := cloned.GetSkipFilterMask(); !ok || mask != 0b101 {
+		t.Fatalf("cloned GetSkipFilterMask() = (%b, %v), want (101, true)", mask, ok)
+	}
+	if mask, ok := cloned.GetSkipScoreMask(); !ok || mask != 0b10 {
+		t.Fatalf("cloned GetSkipScoreMask() = (%b, %v), want (10, true)", mask, ok)
+	}
+
+	c.SetSkipFilterPlugins(sets.New("f2"))
+	if _, ok := c.GetSkipFilterMask(); ok {
+		t.Fatalf("expected SetSkipFilterPlugins to invalidate cached filter mask")
+	}
+	c.SetSkipScorePlugins(sets.New("s3"))
+	if _, ok := c.GetSkipScoreMask(); ok {
+		t.Fatalf("expected SetSkipScorePlugins to invalidate cached score mask")
+	}
+}
+
+func TestCycleStateConcurrentReadWriteDelete(t *testing.T) {
+	c := NewCycleState()
+	var wg sync.WaitGroup
+	for g := range 8 {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			k := fwk.StateKey(fmt.Sprintf("k-%d", id))
+			for i := range 100 {
+				c.Write(k, &fakeData{data: fmt.Sprintf("v-%d-%d", id, i)})
+				if v, err := c.Read(k); err == nil && v == nil {
+					t.Errorf("read nil value for key %s", k)
+				}
+				if i%3 == 0 {
+					c.Delete(k)
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+}
+
+func BenchmarkCycleStateReadWrite(b *testing.B) {
+	keys := []fwk.StateKey{"PreFilterNodeResourcesFit", "PreFilterPodTopologySpread", "PreFilterInterPodAffinity", "PreFilterVolumeBinding", "PreFilterNodeAffinity", "PreFilterNodePorts"}
+	val := &fakeData{data: "state"}
+	b.Run("WriteThenRead", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			c := NewCycleState()
+			for _, k := range keys {
+				c.Write(k, val)
+			}
+			for range 64 {
+				for _, k := range keys {
+					if _, err := c.Read(k); err != nil {
+						b.Fatal(err)
+					}
+				}
+			}
+		}
+	})
 }

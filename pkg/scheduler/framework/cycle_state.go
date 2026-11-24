@@ -19,22 +19,36 @@ package framework
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"k8s.io/apimachinery/pkg/util/sets"
 	fwk "k8s.io/kube-scheduler/framework"
 )
 
-// Note: CycleState uses a sync.Map to back the storage, because it is thread safe. It's aimed to optimize for the "write once and read many times" scenarios.
-// It is the recommended pattern used in all in-tree plugins - plugin-specific state is written once in PreFilter/PreScore and afterward read many times in Filter/Score.
+type cycleStateEntry struct {
+	key fwk.StateKey
+	val fwk.StateData
+}
+
+// Note: CycleState uses an atomic.Pointer to a copy-on-write slice backed by writeLock, because it is thread safe
+// and optimizes for the "write once in PreFilter/PreScore and read many times in Filter/Score" pattern.
 type CycleState struct {
-	// storage is keyed with StateKey, and valued with StateData.
-	storage sync.Map
+	// storage holds copy-on-write StateKey -> StateData entries for zero-alloc lock-free Reads.
+	storage atomic.Pointer[[]cycleStateEntry]
+	// writeLock serializes Write, Delete, and bulk copy operations on storage.
+	writeLock sync.Mutex
 	// if recordPluginMetrics is true, metrics.PluginExecutionDuration will be recorded for this cycle.
 	recordPluginMetrics bool
 	// skipFilterPlugins are plugins that will be skipped in the Filter extension point.
 	skipFilterPlugins sets.Set[string]
+	// skipFilterMask caches the bitmask of skipped Filter plugins (when <= 64 plugins).
+	skipFilterMask    uint64
+	hasSkipFilterMask bool
 	// skipScorePlugins are plugins that will be skipped in the Score extension point.
 	skipScorePlugins sets.Set[string]
+	// skipScoreMask caches the bitmask of skipped Score plugins (when <= 64 plugins).
+	skipScoreMask    uint64
+	hasSkipScoreMask bool
 	// skipPreBindPlugins are plugins that will be skipped in the PreBind extension point.
 	skipPreBindPlugins sets.Set[string]
 	// skipAllPostFilterPlugins indicates whether to skip all plugins in the PostFilter extension point.
@@ -84,18 +98,44 @@ func (c *CycleState) SetRecordPluginMetrics(flag bool) {
 
 func (c *CycleState) SetSkipFilterPlugins(plugins sets.Set[string]) {
 	c.skipFilterPlugins = plugins
+	c.skipFilterMask = 0
+	c.hasSkipFilterMask = false
 }
 
 func (c *CycleState) GetSkipFilterPlugins() sets.Set[string] {
 	return c.skipFilterPlugins
 }
 
+// SetSkipFilterMask records a precomputed bitmask matching skipFilterPlugins.
+func (c *CycleState) SetSkipFilterMask(mask uint64) {
+	c.skipFilterMask = mask
+	c.hasSkipFilterMask = true
+}
+
+// GetSkipFilterMask returns the cached filter skip bitmask if valid.
+func (c *CycleState) GetSkipFilterMask() (uint64, bool) {
+	return c.skipFilterMask, c.hasSkipFilterMask
+}
+
 func (c *CycleState) SetSkipScorePlugins(plugins sets.Set[string]) {
 	c.skipScorePlugins = plugins
+	c.skipScoreMask = 0
+	c.hasSkipScoreMask = false
 }
 
 func (c *CycleState) GetSkipScorePlugins() sets.Set[string] {
 	return c.skipScorePlugins
+}
+
+// SetSkipScoreMask records a precomputed bitmask matching skipScorePlugins.
+func (c *CycleState) SetSkipScoreMask(mask uint64) {
+	c.skipScoreMask = mask
+	c.hasSkipScoreMask = true
+}
+
+// GetSkipScoreMask returns the cached score skip bitmask if valid.
+func (c *CycleState) GetSkipScoreMask() (uint64, bool) {
+	return c.skipScoreMask, c.hasSkipScoreMask
 }
 
 func (c *CycleState) SetSkipPreBindPlugins(plugins sets.Set[string]) {
@@ -190,10 +230,35 @@ func (c *CycleState) CopyPlacementDataInto(placement *fwk.Placement, dst *CycleS
 	if src == nil {
 		return
 	}
-	src.storage.Range(func(k, v interface{}) bool {
-		dst.storage.Store(k, v.(fwk.StateData).Clone())
-		return true
-	})
+	srcPtr := src.storage.Load()
+	if srcPtr == nil || len(*srcPtr) == 0 {
+		return
+	}
+	srcEntries := *srcPtr
+	dst.writeLock.Lock()
+	defer dst.writeLock.Unlock()
+	var oldEntries []cycleStateEntry
+	if dstPtr := dst.storage.Load(); dstPtr != nil {
+		oldEntries = *dstPtr
+	}
+	next := make([]cycleStateEntry, len(oldEntries), len(oldEntries)+len(srcEntries))
+	copy(next, oldEntries)
+	for i := range srcEntries {
+		k := srcEntries[i].key
+		v := srcEntries[i].val.Clone()
+		replaced := false
+		for j := range next {
+			if next[j].key == k {
+				next[j].val = v
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			next = append(next, cycleStateEntry{key: k, val: v})
+		}
+	}
+	dst.storage.Store(&next)
 }
 
 // MergePlacementStatesInto combines the placement states for srcs into a single
@@ -211,32 +276,33 @@ func (c *CycleState) MergePlacementStatesInto(dst *fwk.Placement, srcs ...*fwk.P
 		return nil
 	}
 
-	var merged *CycleState
+	var mergedEntries []cycleStateEntry
 	for _, srcPlacement := range srcs {
 		src := c.placementStates[srcPlacement]
 		if src == nil {
 			continue
 		}
-		var conflict *fwk.StateKey
-		src.storage.Range(func(k, v interface{}) bool {
-			key := k.(fwk.StateKey)
-			if merged == nil {
-				merged = NewCycleState()
+		srcPtr := src.storage.Load()
+		if srcPtr == nil || len(*srcPtr) == 0 {
+			continue
+		}
+		for _, entry := range *srcPtr {
+			for i := range mergedEntries {
+				if mergedEntries[i].key == entry.key {
+					return fmt.Errorf("conflicting placement cycle state key %q while merging into placement %q", entry.key, dst.Name)
+				}
 			}
-			if _, loaded := merged.storage.LoadOrStore(key, v.(fwk.StateData).Clone()); loaded {
-				keyCopy := key
-				conflict = &keyCopy
-				return false
-			}
-			return true
-		})
-		if conflict != nil {
-			return fmt.Errorf("conflicting placement cycle state key %q while merging into placement %q", *conflict, dst.Name)
+			mergedEntries = append(mergedEntries, cycleStateEntry{
+				key: entry.key,
+				val: entry.val.Clone(),
+			})
 		}
 	}
-	if merged == nil {
+	if len(mergedEntries) == 0 {
 		return nil
 	}
+	merged := NewCycleState()
+	merged.storage.Store(&mergedEntries)
 	c.placementStates[dst] = merged
 	return nil
 }
@@ -255,41 +321,59 @@ func (c *CycleState) Clone() fwk.CycleState {
 	if c == nil {
 		return nil
 	}
-	copy := NewCycleState()
+	copied := NewCycleState()
 	// Safe copy storage in case of overwriting.
-	c.storage.Range(func(k, v interface{}) bool {
-		copy.storage.Store(k, v.(fwk.StateData).Clone())
-		return true
-	})
+	if p := c.storage.Load(); p != nil && len(*p) > 0 {
+		src := *p
+		cloned := make([]cycleStateEntry, len(src))
+		for i := range src {
+			cloned[i] = cycleStateEntry{
+				key: src[i].key,
+				val: src[i].val.Clone(),
+			}
+		}
+		copied.storage.Store(&cloned)
+	}
 	// The below are not mutated, so we don't have to safe copy.
-	copy.recordPluginMetrics = c.recordPluginMetrics
-	copy.skipFilterPlugins = c.skipFilterPlugins
-	copy.skipScorePlugins = c.skipScorePlugins
-	copy.skipPreBindPlugins = c.skipPreBindPlugins
-	copy.parallelPreBindPlugins = c.parallelPreBindPlugins
-	copy.podGroupCycleState = c.podGroupCycleState
-	copy.placementCycleState = c.placementCycleState
-	copy.skipAllPostFilterPlugins = c.skipAllPostFilterPlugins
+	copied.recordPluginMetrics = c.recordPluginMetrics
+	copied.skipFilterPlugins = c.skipFilterPlugins
+	copied.skipFilterMask = c.skipFilterMask
+	copied.hasSkipFilterMask = c.hasSkipFilterMask
+	copied.skipScorePlugins = c.skipScorePlugins
+	copied.skipScoreMask = c.skipScoreMask
+	copied.hasSkipScoreMask = c.hasSkipScoreMask
+	copied.skipPreBindPlugins = c.skipPreBindPlugins
+	copied.parallelPreBindPlugins = c.parallelPreBindPlugins
+	copied.podGroupCycleState = c.podGroupCycleState
+	copied.placementCycleState = c.placementCycleState
+	copied.skipAllPostFilterPlugins = c.skipAllPostFilterPlugins
 
 	// Deep copy the per-placement states so the clone does not share mutable StateData.
 	c.placementStatesLock.Lock()
 	if len(c.placementStates) > 0 {
-		copy.placementStates = make(map[*fwk.Placement]*CycleState, len(c.placementStates))
+		copied.placementStates = make(map[*fwk.Placement]*CycleState, len(c.placementStates))
 		for p, st := range c.placementStates {
 			if st == nil {
 				continue
 			}
 			dup := NewCycleState()
-			st.storage.Range(func(k, v interface{}) bool {
-				dup.storage.Store(k, v.(fwk.StateData).Clone())
-				return true
-			})
-			copy.placementStates[p] = dup
+			if stPtr := st.storage.Load(); stPtr != nil && len(*stPtr) > 0 {
+				src := *stPtr
+				cloned := make([]cycleStateEntry, len(src))
+				for i := range src {
+					cloned[i] = cycleStateEntry{
+						key: src[i].key,
+						val: src[i].val.Clone(),
+					}
+				}
+				dup.storage.Store(&cloned)
+			}
+			copied.placementStates[p] = dup
 		}
 	}
 	c.placementStatesLock.Unlock()
 
-	return copy
+	return copied
 }
 
 // Read retrieves data with the given "key" from CycleState. If the key is not
@@ -297,8 +381,15 @@ func (c *CycleState) Clone() fwk.CycleState {
 //
 // See CycleState for notes on concurrency.
 func (c *CycleState) Read(key fwk.StateKey) (fwk.StateData, error) {
-	if v, ok := c.storage.Load(key); ok {
-		return v.(fwk.StateData), nil
+	p := c.storage.Load()
+	if p == nil {
+		return nil, fwk.ErrNotFound
+	}
+	entries := *p
+	for i := range entries {
+		if entries[i].key == key {
+			return entries[i].val, nil
+		}
 	}
 	return nil, fwk.ErrNotFound
 }
@@ -307,12 +398,56 @@ func (c *CycleState) Read(key fwk.StateKey) (fwk.StateData, error) {
 //
 // See CycleState for notes on concurrency.
 func (c *CycleState) Write(key fwk.StateKey, val fwk.StateData) {
-	c.storage.Store(key, val)
+	c.writeLock.Lock()
+	defer c.writeLock.Unlock()
+
+	var oldEntries []cycleStateEntry
+	if p := c.storage.Load(); p != nil {
+		oldEntries = *p
+	}
+	for i := range oldEntries {
+		if oldEntries[i].key == key {
+			next := make([]cycleStateEntry, len(oldEntries))
+			copy(next, oldEntries)
+			next[i].val = val
+			c.storage.Store(&next)
+			return
+		}
+	}
+	next := make([]cycleStateEntry, len(oldEntries)+1)
+	copy(next, oldEntries)
+	next[len(oldEntries)] = cycleStateEntry{key: key, val: val}
+	c.storage.Store(&next)
 }
 
 // Delete deletes data with the given key from CycleState.
 //
 // See CycleState for notes on concurrency.
 func (c *CycleState) Delete(key fwk.StateKey) {
-	c.storage.Delete(key)
+	c.writeLock.Lock()
+	defer c.writeLock.Unlock()
+
+	p := c.storage.Load()
+	if p == nil {
+		return
+	}
+	oldEntries := *p
+	idx := -1
+	for i := range oldEntries {
+		if oldEntries[i].key == key {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return
+	}
+	if len(oldEntries) == 1 {
+		c.storage.Store(nil)
+		return
+	}
+	next := make([]cycleStateEntry, len(oldEntries)-1)
+	copy(next, oldEntries[:idx])
+	copy(next[idx:], oldEntries[idx+1:])
+	c.storage.Store(&next)
 }

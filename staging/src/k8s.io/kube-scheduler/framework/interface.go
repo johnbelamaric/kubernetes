@@ -125,6 +125,13 @@ type Status struct {
 	plugin string
 }
 
+// statusWithReason co-locates a Status and a single-element reason backing array
+// in one allocation without altering Status's struct layout (preserving reflect.DeepEqual).
+type statusWithReason struct {
+	status Status
+	reason [1]string
+}
+
 func (s *Status) WithError(err error) *Status {
 	s.err = err
 	return s
@@ -238,6 +245,18 @@ func (s *Status) String() string {
 
 // Clone clones the entire Status and returns a copy.
 func (s *Status) Clone() *Status {
+	if len(s.reasons) == 1 {
+		swr := &statusWithReason{
+			status: Status{
+				code:   s.code,
+				err:    s.err,
+				plugin: s.plugin,
+			},
+			reason: [1]string{s.reasons[0]},
+		}
+		swr.status.reasons = swr.reason[:1:1]
+		return &swr.status
+	}
 	return &Status{
 		code:    s.code,
 		reasons: slices.Clone(s.reasons),
@@ -248,11 +267,22 @@ func (s *Status) Clone() *Status {
 
 // NewStatus makes a Status out of the given arguments and returns its pointer.
 func NewStatus(code Code, reasons ...string) *Status {
-	s := &Status{
-		code:    code,
-		reasons: reasons,
+	switch len(reasons) {
+	case 0:
+		return &Status{code: code}
+	case 1:
+		swr := &statusWithReason{
+			status: Status{code: code},
+			reason: [1]string{reasons[0]},
+		}
+		swr.status.reasons = swr.reason[:1:1]
+		return &swr.status
+	default:
+		return &Status{
+			code:    code,
+			reasons: slices.Clone(reasons),
+		}
 	}
-	return s
 }
 
 // AsStatus wraps an error in a Status.
